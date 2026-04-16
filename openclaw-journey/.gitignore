@@ -1,0 +1,4 @@
+# Ignore any local notes with sensitive info
+*.env
+secrets.md
+private.md
