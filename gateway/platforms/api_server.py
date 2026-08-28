@@ -30,6 +30,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -53,6 +54,84 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+
+# Process start time — used as SystemHealth.uptimeSince for the telemetry API.
+_process_start_time = time.time()
+
+_TELEMETRY_RANGE_SECONDS = {"1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000}
+_TELEMETRY_BUCKET_SECONDS = {"1h": 60, "24h": 3600, "7d": 86400, "30d": 86400}
+
+
+def _hermes_version() -> str:
+    """Best-effort version string, read from pyproject.toml (no hard dependency on it existing)."""
+    try:
+        pyproject = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
+        text = pyproject.read_text(encoding="utf-8")
+        m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+def _slugify_model(model: Optional[str]) -> str:
+    """Turn a model name into a stable id usable as an Agent/AgentEdge id."""
+    if not model:
+        return "unknown"
+    return re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-") or "unknown"
+
+
+def _job_status(session: Dict[str, Any]) -> str:
+    if session.get("ended_at") is None:
+        return "running"
+    if session.get("end_reason") in ("error", "exception", "failed"):
+        return "failed"
+    return "completed"
+
+
+def _error_category(end_reason: Optional[str]) -> str:
+    reason = (end_reason or "").lower()
+    if "timeout" in reason and "agent" in reason:
+        return "agent_timeout"
+    if "timeout" in reason:
+        return "llm_timeout"
+    if "tool" in reason:
+        return "tool_failure"
+    if "retry" in reason:
+        return "retry_exhausted"
+    if "invalid" in reason:
+        return "invalid_response"
+    return "system_error"
+
+
+def _session_to_job(session: Dict[str, Any]) -> Dict[str, Any]:
+    started_ms = int((session.get("started_at") or 0) * 1000)
+    ended_at = session.get("ended_at")
+    ended_ms = int(ended_at * 1000) if ended_at is not None else None
+    duration = (ended_at - session["started_at"]) if ended_at is not None else (time.time() - session["started_at"])
+    return {
+        "id": session["id"],
+        "traceId": session["id"],
+        "type": "session",
+        "title": session.get("title") or session["id"],
+        "status": _job_status(session),
+        "startTime": started_ms,
+        "endTime": ended_ms,
+        "duration": duration,
+        # Agent ids here must match the slugs Agent.id uses (see _slugify_model callers
+        # below) — jobs.tsx/agents.tsx/topology.tsx cross-reference Job.agents against
+        # Agent.id by equality.
+        "agents": [_slugify_model(session["model"])] if session.get("model") else [],
+        "toolCalls": session.get("tool_call_count") or 0,
+        "tokens": (session.get("input_tokens") or 0) + (session.get("output_tokens") or 0)
+        + (session.get("cache_read_tokens") or 0) + (session.get("cache_write_tokens") or 0)
+        + (session.get("reasoning_tokens") or 0),
+        "inputTokens": session.get("input_tokens") or 0,
+        "outputTokens": session.get("output_tokens") or 0,
+        "cost": session.get("actual_cost_usd") or session.get("estimated_cost_usd") or 0,
+        "retries": 0,  # no retry tracking exists in this codebase
+    }
 
 
 def check_api_server_requirements() -> bool:
@@ -1708,6 +1787,222 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams_created.pop(run_id, None)
 
     # ------------------------------------------------------------------
+    # Telemetry API (Hermes Navigator dashboard)
+    # ------------------------------------------------------------------
+
+    def _telemetry_range_seconds(self, request: "web.Request") -> int:
+        range_key = request.query.get("range", "24h")
+        return _TELEMETRY_RANGE_SECONDS.get(range_key, _TELEMETRY_RANGE_SECONDS["24h"])
+
+    async def _handle_telemetry_health(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/health — maps to the dashboard's SystemHealth shape."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        stats = db.get_health_stats()
+        agents = db.list_agents_rollup()
+        return web.json_response({
+            "status": "operational",  # this handler responding IS the health signal
+            "version": _hermes_version(),
+            "uptimePct": 100.0,  # no historical downtime tracking exists
+            "uptimeSince": int(_process_start_time * 1000),
+            "agentsTotal": len(agents),
+            "agentsActive": sum(1 for a in agents if a["active_jobs"] > 0),
+            "activeJobs": stats["active"],
+            "jobsToday": stats["jobs_today"],
+            "requestsToday": stats["requests_today"],
+            "successRate": stats["success_rate"],
+            "p95Latency": stats["p95_latency"],
+            "tokens": stats["tokens"],
+            "cost": stats["cost"],
+            "errorRate": stats["error_rate"],
+        })
+
+    async def _handle_telemetry_jobs(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/jobs?environment=&range= — list jobs (sessions)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        # `environment` is accepted but ignored — no per-session environment tag exists yet.
+        range_seconds = self._telemetry_range_seconds(request)
+        jobs = [_session_to_job(s) for s in db.list_jobs(range_seconds)]
+        return web.json_response(jobs)
+
+    async def _handle_telemetry_job(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/jobs/{job_id} — a single job (session)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        session = db.get_session(request.match_info["job_id"])
+        if session is None:
+            return web.json_response({"error": "job not found"}, status=404)
+        return web.json_response(_session_to_job(session))
+
+    async def _handle_telemetry_trace(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/trace/{trace_id} — a single-span trace (traceId == session id)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        session = db.get_session(request.match_info["trace_id"])
+        if session is None:
+            return web.json_response({"error": "trace not found"}, status=404)
+
+        job = _session_to_job(session)
+        duration_ms = int(job["duration"] * 1000)
+        span_status = "running" if job["status"] == "running" else ("error" if job["status"] == "failed" else "ok")
+        span = {
+            "id": session["id"],
+            "parentId": None,
+            "traceId": session["id"],
+            "agentId": None,
+            "type": "run",
+            "name": job["title"],
+            "startTime": 0,
+            "duration": duration_ms,
+            "status": span_status,
+            "tokens": job["tokens"],
+            "inputTokens": job["inputTokens"],
+            "outputTokens": job["outputTokens"],
+            "cost": job["cost"],
+            "metadata": {"model": session.get("model") or ""},
+        }
+        return web.json_response({
+            "traceId": session["id"],
+            "jobId": session["id"],
+            "startTime": job["startTime"],
+            "duration": job["duration"],
+            "status": job["status"],
+            "spans": [span],
+        })
+
+    async def _handle_telemetry_metrics(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/metrics?range= — bucketed time series."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        range_key = request.query.get("range", "24h")
+        range_seconds = _TELEMETRY_RANGE_SECONDS.get(range_key, _TELEMETRY_RANGE_SECONDS["24h"])
+        bucket_seconds = _TELEMETRY_BUCKET_SECONDS.get(range_key, _TELEMETRY_BUCKET_SECONDS["24h"])
+        buckets = db.list_metrics_timeseries(range_seconds, bucket_seconds)
+        points = [
+            {
+                "timestamp": int(b["timestamp"] * 1000),
+                "jobs": b["jobs"],
+                "tokens": b["tokens"],
+                "inputTokens": b["inputTokens"],
+                "outputTokens": b["outputTokens"],
+                "cost": b["cost"],
+                "latency": b["latency"],
+                "errors": b["errors"],
+                "llmCalls": b["llmCalls"],
+            }
+            for b in buckets
+        ]
+        return web.json_response(points)
+
+    async def _handle_telemetry_errors(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/errors?range= — error events."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        range_seconds = self._telemetry_range_seconds(request)
+        errors = []
+        for s in db.list_errors(range_seconds):
+            ended_at = s.get("ended_at")
+            errors.append({
+                "id": f"ERR-{s['id']}",
+                "category": _error_category(s.get("end_reason")),
+                "jobId": s["id"],
+                "traceId": s["id"],
+                "agentId": _slugify_model(s.get("model")),
+                "operation": "session",
+                "message": s.get("end_reason") or "session ended in error",
+                "timestamp": int((ended_at or s["started_at"]) * 1000),
+                "retries": 0,
+            })
+        return web.json_response(errors)
+
+    async def _handle_telemetry_agents(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/agents — one entry per model."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        agents = []
+        for a in db.list_agents_rollup():
+            model = a["model"] or "unknown"
+            agents.append({
+                "id": _slugify_model(model),
+                "name": model,
+                "status": "active" if a["active_jobs"] > 0 else "idle",
+                "type": "llm",
+                "version": "",
+                "model": model,
+                "jobs": a["jobs"],
+                "activeJobs": a["active_jobs"],
+                "latency": a["latency"],
+                "p95": a["p95_latency"],
+                "successRate": a["success_rate"],
+                "llmCalls": a["llm_calls"],  # proxied via tool_call_count — no separate LLM-call counter exists
+                "inputTokens": a["input_tokens"],
+                "outputTokens": a["output_tokens"],
+                "tokens": a["tokens"],
+                "cost": a["cost"],
+                "errors": a["errors"],
+            })
+        return web.json_response(agents)
+
+    async def _handle_telemetry_edges(self, request: "web.Request") -> "web.Response":
+        """GET /v1/telemetry/edges — parent/child model call pairs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"error": "session store unavailable"}, status=503)
+
+        edges = [
+            {
+                "source": _slugify_model(e["source"]),
+                "target": _slugify_model(e["target"]),
+                "calls": e["calls"],
+                "latency": e["latency"],
+                "errors": e["errors"],
+                "tokens": e["tokens"],
+                "cost": e["cost"],
+            }
+            for e in db.list_edges_rollup()
+        ]
+        return web.json_response(edges)
+
+    # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
 
@@ -1740,6 +2035,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            # Telemetry API (Hermes Navigator dashboard)
+            self._app.router.add_get("/v1/telemetry/health", self._handle_telemetry_health)
+            self._app.router.add_get("/v1/telemetry/jobs", self._handle_telemetry_jobs)
+            self._app.router.add_get("/v1/telemetry/jobs/{job_id}", self._handle_telemetry_job)
+            self._app.router.add_get("/v1/telemetry/trace/{trace_id}", self._handle_telemetry_trace)
+            self._app.router.add_get("/v1/telemetry/metrics", self._handle_telemetry_metrics)
+            self._app.router.add_get("/v1/telemetry/errors", self._handle_telemetry_errors)
+            self._app.router.add_get("/v1/telemetry/agents", self._handle_telemetry_agents)
+            self._app.router.add_get("/v1/telemetry/edges", self._handle_telemetry_edges)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
