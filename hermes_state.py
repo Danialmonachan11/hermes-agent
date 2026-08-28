@@ -785,6 +785,224 @@ class SessionDB:
         return sessions
 
     # =========================================================================
+    # Telemetry aggregation (read-only; backs the dashboard's REST API)
+    # =========================================================================
+
+    # Single source of truth for "did this session end in error" — reused by
+    # every telemetry method below instead of being redefined per-query.
+    _FAILURE_END_REASONS = ("error", "exception", "failed")
+    _FAILURE_SQL = "end_reason IN ('error', 'exception', 'failed')"
+
+    @staticmethod
+    def _percentile(values: List[float], pct: float) -> float:
+        """Nearest-rank percentile over a list of numbers. 0.0 if empty."""
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        idx = min(len(ordered) - 1, max(0, int(pct * len(ordered) + 0.5) - 1))
+        return ordered[idx]
+
+    def get_health_stats(self) -> Dict[str, Any]:
+        """Aggregate stats over all top-level sessions, for the health endpoint."""
+        today_start = time.mktime(time.localtime(time.time())[:3] + (0, 0, 0, 0, 0, -1))
+        with self._lock:
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NULL"
+            ).fetchone()[0]
+            active = self._conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NULL AND ended_at IS NULL"
+            ).fetchone()[0]
+            today_row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(message_count), 0) FROM sessions "
+                "WHERE parent_session_id IS NULL AND started_at >= ?",
+                (today_start,),
+            ).fetchone()
+            jobs_today, requests_today = today_row[0], today_row[1]
+            fail_row = self._conn.execute(
+                f"SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NULL AND {self._FAILURE_SQL}"
+            ).fetchone()[0]
+            totals = self._conn.execute(
+                "SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + "
+                "cache_write_tokens + reasoning_tokens), 0), "
+                "COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0) "
+                "FROM sessions WHERE parent_session_id IS NULL"
+            ).fetchone()
+            durations = [
+                row[0] for row in self._conn.execute(
+                    "SELECT ended_at - started_at FROM sessions "
+                    "WHERE parent_session_id IS NULL AND ended_at IS NOT NULL"
+                ).fetchall()
+            ]
+        success_rate = (total - fail_row) / total if total else 1.0
+        return {
+            "total": total,
+            "active": active,
+            "jobs_today": jobs_today,
+            "requests_today": requests_today,
+            "success_rate": success_rate,
+            "error_rate": 1.0 - success_rate,
+            "p95_latency": self._percentile(durations, 0.95),
+            "tokens": totals[0],
+            "cost": totals[1],
+        }
+
+    def list_jobs(self, range_seconds: float, limit: int = 500) -> List[Dict[str, Any]]:
+        """Top-level sessions started within the last *range_seconds*."""
+        cutoff = time.time() - range_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM sessions WHERE parent_session_id IS NULL AND started_at >= ? "
+                "ORDER BY started_at DESC LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_metrics_timeseries(self, range_seconds: float, bucket_seconds: float) -> List[Dict[str, Any]]:
+        """Bucket top-level sessions by started_at into bucket_seconds-wide windows.
+
+        Buckets covering the full range are returned even when empty (0-filled).
+        """
+        now = time.time()
+        cutoff = now - range_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT started_at, ended_at, input_tokens, output_tokens, cache_read_tokens, "
+                "cache_write_tokens, reasoning_tokens, COALESCE(actual_cost_usd, estimated_cost_usd, 0) AS cost, "
+                f"tool_call_count, {self._FAILURE_SQL} AS is_error "
+                "FROM sessions WHERE parent_session_id IS NULL AND started_at >= ?",
+                (cutoff,),
+            ).fetchall()
+
+        first_bucket = int(cutoff // bucket_seconds) * bucket_seconds
+        last_bucket = int(now // bucket_seconds) * bucket_seconds
+        buckets: Dict[int, Dict[str, Any]] = {}
+        ts = first_bucket
+        while ts <= last_bucket:
+            buckets[ts] = {
+                "timestamp": ts, "jobs": 0, "tokens": 0, "inputTokens": 0, "outputTokens": 0,
+                "cost": 0.0, "errors": 0, "llmCalls": 0, "_durations": [],
+            }
+            ts += bucket_seconds
+
+        for row in rows:
+            bucket_ts = int(row["started_at"] // bucket_seconds) * bucket_seconds
+            b = buckets.setdefault(bucket_ts, {
+                "timestamp": bucket_ts, "jobs": 0, "tokens": 0, "inputTokens": 0, "outputTokens": 0,
+                "cost": 0.0, "errors": 0, "llmCalls": 0, "_durations": [],
+            })
+            b["jobs"] += 1
+            in_tok = row["input_tokens"] or 0
+            out_tok = row["output_tokens"] or 0
+            b["inputTokens"] += in_tok
+            b["outputTokens"] += out_tok
+            b["tokens"] += in_tok + out_tok + (row["cache_read_tokens"] or 0) + \
+                (row["cache_write_tokens"] or 0) + (row["reasoning_tokens"] or 0)
+            b["cost"] += row["cost"] or 0
+            # tool_call_count is used as a proxy for llm_calls — no separate LLM-call counter exists.
+            b["llmCalls"] += row["tool_call_count"] or 0
+            if row["is_error"]:
+                b["errors"] += 1
+            if row["ended_at"] is not None:
+                b["_durations"].append(row["ended_at"] - row["started_at"])
+
+        result = []
+        for ts in sorted(buckets.keys()):
+            b = buckets[ts]
+            durations = b.pop("_durations")
+            b["latency"] = (sum(durations) / len(durations)) if durations else 0.0
+            result.append(b)
+        return result
+
+    def list_errors(self, range_seconds: float, limit: int = 200) -> List[Dict[str, Any]]:
+        """Top-level and child sessions that ended in error, most recent first."""
+        cutoff = time.time() - range_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM sessions WHERE {self._FAILURE_SQL} AND started_at >= ? "
+                "ORDER BY started_at DESC LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_agents_rollup(self) -> List[Dict[str, Any]]:
+        """Group every session (top-level and children) by model — each model is a distinct agent identity."""
+        with self._lock:
+            groups = self._conn.execute(
+                "SELECT model, COUNT(*) AS jobs, "
+                "SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END) AS active_jobs, "
+                "COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + "
+                "reasoning_tokens), 0) AS tokens, "
+                "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+                "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+                "COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0) AS cost, "
+                "COALESCE(SUM(tool_call_count), 0) AS llm_calls, "
+                f"SUM(CASE WHEN {self._FAILURE_SQL} THEN 1 ELSE 0 END) AS errors "
+                "FROM sessions GROUP BY model"
+            ).fetchall()
+            durations_by_model: Dict[str, List[float]] = {}
+            for row in self._conn.execute(
+                "SELECT model, ended_at - started_at AS d FROM sessions WHERE ended_at IS NOT NULL"
+            ).fetchall():
+                durations_by_model.setdefault(row["model"], []).append(row["d"])
+
+        result = []
+        for row in groups:
+            model = row["model"]
+            durations = durations_by_model.get(model, [])
+            jobs = row["jobs"]
+            result.append({
+                "model": model,
+                "jobs": jobs,
+                "active_jobs": row["active_jobs"],
+                "tokens": row["tokens"],
+                "input_tokens": row["input_tokens"],
+                "output_tokens": row["output_tokens"],
+                "cost": row["cost"],
+                "llm_calls": row["llm_calls"],
+                "errors": row["errors"],
+                "success_rate": (jobs - row["errors"]) / jobs if jobs else 1.0,
+                "latency": (sum(durations) / len(durations)) if durations else 0.0,
+                "p95_latency": self._percentile(durations, 0.95),
+            })
+        return result
+
+    def list_edges_rollup(self) -> List[Dict[str, Any]]:
+        """Group parent->child session pairs by (parent.model, child.model)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT p.model AS source, c.model AS target, "
+                "COUNT(*) AS calls, "
+                "COALESCE(SUM(c.input_tokens + c.output_tokens + c.cache_read_tokens + "
+                "c.cache_write_tokens + c.reasoning_tokens), 0) AS tokens, "
+                "COALESCE(SUM(COALESCE(c.actual_cost_usd, c.estimated_cost_usd, 0)), 0) AS cost, "
+                f"SUM(CASE WHEN c.{self._FAILURE_SQL} THEN 1 ELSE 0 END) AS errors "
+                "FROM sessions c JOIN sessions p ON c.parent_session_id = p.id "
+                "WHERE c.parent_session_id IS NOT NULL "
+                "GROUP BY p.model, c.model"
+            ).fetchall()
+            durations_by_pair: Dict[tuple, List[float]] = {}
+            for row in self._conn.execute(
+                "SELECT p.model AS source, c.model AS target, c.ended_at - c.started_at AS d "
+                "FROM sessions c JOIN sessions p ON c.parent_session_id = p.id "
+                "WHERE c.parent_session_id IS NOT NULL AND c.ended_at IS NOT NULL"
+            ).fetchall():
+                durations_by_pair.setdefault((row["source"], row["target"]), []).append(row["d"])
+
+        result = []
+        for row in rows:
+            durations = durations_by_pair.get((row["source"], row["target"]), [])
+            result.append({
+                "source": row["source"],
+                "target": row["target"],
+                "calls": row["calls"],
+                "tokens": row["tokens"],
+                "cost": row["cost"],
+                "errors": row["errors"],
+                "latency": (sum(durations) / len(durations)) if durations else 0.0,
+            })
+        return result
+
+    # =========================================================================
     # Message storage
     # =========================================================================
 
